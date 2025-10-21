@@ -46,14 +46,14 @@ def plot_importance(json_path, output_image, title):
     # Create the plot
     plt.figure(figsize=(15, 8))
     
-    # Use a log scale for the y-axis to see small values
-    # Remove this line if you prefer a linear scale
-    plt.yscale('log') 
+    # --- THIS LINE WAS REMOVED ---
+    # plt.yscale('log') 
+    # --- --------------------- ---
     
     plt.bar(df_sorted['Layer'], df_sorted['Importance'])
     
     plt.title(title, fontsize=16)
-    plt.ylabel('Fisher Importance (Log Scale)')
+    plt.ylabel('Fisher Importance (Linear Scale)')
     plt.xlabel('Model Layer')
     
     # Rotate x-axis labels for readability

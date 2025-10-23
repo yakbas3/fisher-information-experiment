@@ -288,7 +288,7 @@ class TaskVectorCalculator:
         print("-" * 70)
         
         layer_stats = analysis['layer_stats']
-        for layer_id in sorted(layer_stats.keys(), key=self._get_sort_key):
+        for layer_id in sorted(layer_stats.keys(), key=get_sort_key):
             stats = layer_stats[layer_id]
             print(f"{layer_id:<20} {stats['total_norm']:>15.6f} {stats['mean_norm']:>15.6f} {stats['parameter_count']:>8}")
         

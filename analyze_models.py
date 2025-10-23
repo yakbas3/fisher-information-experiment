@@ -67,48 +67,18 @@ class ModelAnalyzer:
         print("="*80)
     
     def load_models(self):
-        """Load both models and verify compatibility"""
-        print("\nLoading models...")
+        """Load tokenizers and verify compatibility (models loaded on-demand)"""
+        print("\nLoading tokenizers...")
         
         # Load tokenizers
-        print("Loading tokenizers...")
         self.base_tokenizer = AutoTokenizer.from_pretrained(self.base_model_path)
         self.instruct_tokenizer = AutoTokenizer.from_pretrained(self.instruct_model_path)
         
         if self.base_tokenizer.vocab != self.instruct_tokenizer.vocab:
             print("⚠️  Warning: Tokenizer vocabularies differ between models")
         
-        # Load models
-        print("Loading base model...")
-        dtype = torch.float16 if self.use_fp16 else torch.float32
-        self.base_model = AutoModelForCausalLM.from_pretrained(
-            self.base_model_path,
-            torch_dtype=dtype,
-            device_map=self.device,
-            trust_remote_code=True,
-            use_safetensors=True
-        )
-        
-        print("Loading instruct model...")
-        self.instruct_model = AutoModelForCausalLM.from_pretrained(
-            self.instruct_model_path,
-            torch_dtype=dtype,
-            device_map=self.device,
-            trust_remote_code=True,
-            use_safetensors=True
-        )
-        
-        # Set to training mode but disable dropout
-        for model in [self.base_model, self.instruct_model]:
-            model.train()
-            for module in model.modules():
-                if isinstance(module, torch.nn.Dropout):
-                    module.p = 0
-        
-        # Verify compatibility
-        self._verify_model_compatibility()
-        
-        print("✓ Models loaded successfully")
+        print("✓ Tokenizers loaded successfully")
+        print("✓ Models will be loaded on-demand to save memory")
     
     def _verify_model_compatibility(self):
         """Verify that both models have the same architecture"""
@@ -141,11 +111,35 @@ class ModelAnalyzer:
         
         print("✓ Model architectures are compatible")
     
-    def compute_fisher_information(self, model, model_name, calibration_texts, batch_size=4, 
+    def load_model(self, model_path, model_name):
+        """Load a single model on-demand"""
+        print(f"\nLoading {model_name} model...")
+        dtype = torch.float16 if self.use_fp16 else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            device_map=self.device,
+            trust_remote_code=True,
+            use_safetensors=True
+        )
+        
+        # Set to training mode but disable dropout
+        model.train()
+        for module in model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.p = 0
+        
+        print(f"✓ {model_name} model loaded successfully")
+        return model
+
+    def compute_fisher_information(self, model_path, model_name, calibration_texts, batch_size=4, 
                                  num_samples=500, max_length=512):
         """Compute Fisher Information Matrix for a model"""
         print(f"\nComputing Fisher Information for {model_name}...")
         print(f"Samples: {min(len(calibration_texts), num_samples)}")
+        
+        # Load model on-demand
+        model = self.load_model(model_path, model_name)
         
         # Prepare data
         dataset = TextDataset(
@@ -215,15 +209,25 @@ class ModelAnalyzer:
         if total_fisher == 0 or torch.isnan(torch.tensor(total_fisher)):
             print(f"⚠️  WARNING: Fisher information is zero or NaN for {model_name}!")
         
+        # Clear model from memory
+        del model
+        torch.cuda.empty_cache()
+        print(f"✓ {model_name} model cleared from memory")
+        
         return fisher_dict
     
     def calculate_task_vector(self):
         """Calculate task vector = instruct_model - base_model"""
         print("\nCalculating task vector...")
         
+        # Load both models for comparison
+        print("Loading both models for task vector calculation...")
+        base_model = self.load_model(self.base_model_path, "base")
+        instruct_model = self.load_model(self.instruct_model_path, "instruct")
+        
         task_vector = {}
-        base_params = dict(self.base_model.named_parameters())
-        instruct_params = dict(self.instruct_model.named_parameters())
+        base_params = dict(base_model.named_parameters())
+        instruct_params = dict(instruct_model.named_parameters())
         
         for name in tqdm(base_params.keys(), desc="Computing differences"):
             base_weight = base_params[name]
@@ -231,6 +235,10 @@ class ModelAnalyzer:
             difference = instruct_weight - base_weight
             task_vector[name] = difference.detach().cpu()
         
+        # Clear models from memory
+        del base_model, instruct_model
+        torch.cuda.empty_cache()
+        print("✓ Both models cleared from memory")
         print("✓ Task vector calculated")
         return task_vector
     
@@ -556,12 +564,12 @@ def main():
     
     # Compute Fisher Information for both models
     base_fisher = analyzer.compute_fisher_information(
-        analyzer.base_model, "base", calibration_texts,
+        analyzer.base_model_path, "base", calibration_texts,
         batch_size=args.batch_size, num_samples=args.num_samples, max_length=args.max_length
     )
     
     instruct_fisher = analyzer.compute_fisher_information(
-        analyzer.instruct_model, "instruct", calibration_texts,
+        analyzer.instruct_model_path, "instruct", calibration_texts,
         batch_size=args.batch_size, num_samples=args.num_samples, max_length=args.max_length
     )
     

@@ -242,6 +242,99 @@ class ModelAnalyzer:
         print("✓ Task vector calculated")
         return task_vector
     
+    def compute_task_vector_fisher(self, task_vector, calibration_texts, batch_size=4, 
+                                 num_samples=500, max_length=512):
+        """Compute Fisher Information for the task vector by applying it to base model"""
+        print("\nComputing Fisher Information for Task Vector...")
+        print(f"Samples: {min(len(calibration_texts), num_samples)}")
+        
+        # Load base model
+        base_model = self.load_model(self.base_model_path, "base")
+        
+        # Apply task vector to base model to create "instruct-like" model
+        print("Applying task vector to base model...")
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                if name in task_vector:
+                    # Move task vector to same device as model
+                    task_vector_tensor = task_vector[name].to(param.device).to(param.dtype)
+                    param.data += task_vector_tensor
+        
+        # Prepare data
+        dataset = TextDataset(
+            calibration_texts[:num_samples],
+            self.base_tokenizer,
+            max_length
+        )
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        
+        # Initialize accumulators
+        fisher_dict = {}
+        for name, param in base_model.named_parameters():
+            if param.requires_grad:
+                fisher_dict[name] = torch.zeros_like(param, dtype=torch.float32)
+        
+        num_batches_processed = 0
+        total_samples_processed = 0
+        
+        # Accumulate Fisher Information
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Processing task vector")):
+            if total_samples_processed >= num_samples:
+                break
+            
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
+            batch_size_actual = input_ids.size(0)
+            
+            # Forward pass with gradient tracking
+            base_model.zero_grad()
+            
+            with torch.enable_grad():
+                outputs = base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=input_ids
+                )
+                
+                loss = outputs.loss
+                
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: Invalid loss detected in batch {batch_idx}, skipping")
+                    continue
+                
+                # Backward pass
+                loss.backward()
+                
+                # Accumulate squared gradients (Fisher diagonal approximation)
+                for name, param in base_model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        grad_squared = param.grad.detach().to(torch.float32).pow(2)
+                        fisher_dict[name] += grad_squared
+            
+            num_batches_processed += 1
+            total_samples_processed += batch_size_actual
+        
+        # Normalize by number of samples
+        print(f"Normalizing Fisher values by {total_samples_processed} samples...")
+        for name in fisher_dict:
+            fisher_dict[name] /= total_samples_processed
+        
+        print(f"✓ Computed Fisher for task vector: {total_samples_processed} samples")
+        
+        # Validate results
+        total_fisher = sum(f.sum().item() for f in fisher_dict.values())
+        print(f"✓ Total Fisher Information (task vector): {total_fisher:.6e}")
+        
+        if total_fisher == 0 or torch.isnan(torch.tensor(total_fisher)):
+            print(f"⚠️  WARNING: Fisher information is zero or NaN for task vector!")
+        
+        # Clear model from memory
+        del base_model
+        torch.cuda.empty_cache()
+        print(f"✓ Task vector model cleared from memory")
+        
+        return fisher_dict
+    
     def aggregate_by_layer(self, fisher_dict):
         """Aggregate Fisher values by layer"""
         layer_importance = defaultdict(float)
@@ -404,8 +497,8 @@ class ModelAnalyzer:
         
         return analysis
     
-    def save_results(self, base_fisher, instruct_fisher, task_vector, 
-                    base_layers, instruct_layers, task_analysis, fisher_comparison, output_dir):
+    def save_results(self, base_fisher, instruct_fisher, task_vector, task_vector_fisher,
+                    base_layers, instruct_layers, task_vector_layers, task_analysis, fisher_comparison, task_vector_comparison, output_dir):
         """Save all results to disk"""
         os.makedirs(output_dir, exist_ok=True)
         
@@ -414,12 +507,16 @@ class ModelAnalyzer:
         # Save Fisher Information
         torch.save(base_fisher, f'{output_dir}/base_fisher_diagonal.pt')
         torch.save(instruct_fisher, f'{output_dir}/instruct_fisher_diagonal.pt')
+        torch.save(task_vector_fisher, f'{output_dir}/task_vector_fisher_diagonal.pt')
         
         with open(f'{output_dir}/base_layer_importance.json', 'w') as f:
             json.dump(base_layers, f, indent=2)
         
         with open(f'{output_dir}/instruct_layer_importance.json', 'w') as f:
             json.dump(instruct_layers, f, indent=2)
+        
+        with open(f'{output_dir}/task_vector_layer_importance.json', 'w') as f:
+            json.dump(task_vector_layers, f, indent=2)
         
         # Save Task Vector
         torch.save(task_vector, f'{output_dir}/task_vector.pt')
@@ -428,10 +525,14 @@ class ModelAnalyzer:
             analysis_serializable = self._make_json_serializable(task_analysis)
             json.dump(analysis_serializable, f, indent=2)
         
-        # Save Fisher Comparison
+        # Save Fisher Comparisons
         with open(f'{output_dir}/fisher_comparison.json', 'w') as f:
             comparison_serializable = self._make_json_serializable(fisher_comparison)
             json.dump(comparison_serializable, f, indent=2)
+        
+        with open(f'{output_dir}/task_vector_fisher_comparison.json', 'w') as f:
+            task_comparison_serializable = self._make_json_serializable(task_vector_comparison)
+            json.dump(task_comparison_serializable, f, indent=2)
         
         # Save model info
         model_info = {
@@ -462,7 +563,7 @@ class ModelAnalyzer:
         else:
             return obj
     
-    def print_comprehensive_analysis(self, base_layers, instruct_layers, task_analysis, fisher_comparison):
+    def print_comprehensive_analysis(self, base_layers, instruct_layers, task_analysis, fisher_comparison, task_vector_layers, task_vector_comparison):
         """Print comprehensive analysis results"""
         print("\n" + "="*80)
         print("COMPREHENSIVE ANALYSIS RESULTS")
@@ -474,6 +575,11 @@ class ModelAnalyzer:
         print(f"  Instruct model total Fisher: {fisher_comparison['instruct_total_fisher']:.6e}")
         print(f"  Fisher ratio (instruct/base): {fisher_comparison['fisher_ratio']:.4f}")
         
+        # Task Vector Fisher Information
+        print(f"\nTASK VECTOR FISHER INFORMATION:")
+        print(f"  Task vector total Fisher: {task_vector_comparison['instruct_total_fisher']:.6e}")
+        print(f"  Fisher ratio (task_vector/base): {task_vector_comparison['fisher_ratio']:.4f}")
+        
         # Task Vector Analysis
         overall = task_analysis['overall_stats']
         print(f"\nTASK VECTOR ANALYSIS:")
@@ -482,16 +588,51 @@ class ModelAnalyzer:
         print(f"  Max parameter norm: {overall['max_norm']:.6f}")
         print(f"  Min parameter norm: {overall['min_norm']:.6f}")
         
-        # Layer importance comparison
-        print(f"\nTOP 10 LAYERS BY CHANGE (Task Vector):")
-        print(f"{'Layer':<20} {'Base Fisher':>15} {'Instruct Fisher':>15} {'Difference':>15}")
-        print("-" * 70)
+        # Layer importance comparison (Base vs Instruct)
+        print(f"\nTOP 10 LAYERS BY CHANGE (Base vs Instruct):")
+        print(f"{'Layer':<20} {'Base Fisher':>15} {'Instruct Fisher':>15} {'Difference':>15} {'% Change':>12}")
+        print("-" * 85)
         
         layer_comp = fisher_comparison['layer_comparison']
         sorted_layers = sorted(layer_comp.items(), key=lambda x: abs(x[1]['difference']), reverse=True)
         
         for layer, stats in sorted_layers[:10]:
-            print(f"{layer:<20} {stats['base_importance']:>15.6f} {stats['instruct_importance']:>15.6f} {stats['difference']:>15.6f}")
+            base_val = stats['base_importance']
+            instruct_val = stats['instruct_importance']
+            diff = stats['difference']
+            
+            # Calculate percentage change
+            if base_val > 0:
+                pct_change = (diff / base_val) * 100
+            else:
+                pct_change = float('inf') if diff > 0 else 0
+            
+            pct_str = f"{pct_change:+.2f}%" if pct_change != float('inf') else "∞%"
+            
+            print(f"{layer:<20} {base_val:>15.6f} {instruct_val:>15.6f} {diff:>15.6f} {pct_str:>12}")
+        
+        # Layer importance comparison (Base vs Task Vector)
+        print(f"\nTOP 10 LAYERS BY CHANGE (Base vs Task Vector):")
+        print(f"{'Layer':<20} {'Base Fisher':>15} {'Task Vector Fisher':>15} {'Difference':>15} {'% Change':>12}")
+        print("-" * 85)
+        
+        task_layer_comp = task_vector_comparison['layer_comparison']
+        sorted_task_layers = sorted(task_layer_comp.items(), key=lambda x: abs(x[1]['difference']), reverse=True)
+        
+        for layer, stats in sorted_task_layers[:10]:
+            base_val = stats['base_importance']
+            task_val = stats['instruct_importance']  # This is actually task vector Fisher
+            diff = stats['difference']
+            
+            # Calculate percentage change
+            if base_val > 0:
+                pct_change = (diff / base_val) * 100
+            else:
+                pct_change = float('inf') if diff > 0 else 0
+            
+            pct_str = f"{pct_change:+.2f}%" if pct_change != float('inf') else "∞%"
+            
+            print(f"{layer:<20} {base_val:>15.6f} {task_val:>15.6f} {diff:>15.6f} {pct_str:>12}")
         
         print("="*80)
 
@@ -576,9 +717,16 @@ def main():
     # Calculate task vector
     task_vector = analyzer.calculate_task_vector()
     
+    # Compute Fisher Information for task vector
+    task_vector_fisher = analyzer.compute_task_vector_fisher(
+        task_vector, calibration_texts,
+        batch_size=args.batch_size, num_samples=args.num_samples, max_length=args.max_length
+    )
+    
     # Aggregate by layer
     base_layers = analyzer.aggregate_by_layer(base_fisher)
     instruct_layers = analyzer.aggregate_by_layer(instruct_fisher)
+    task_vector_layers = analyzer.aggregate_by_layer(task_vector_fisher)
     
     # Analyze task vector
     task_analysis = analyzer.analyze_task_vector(task_vector)
@@ -586,13 +734,16 @@ def main():
     # Compare Fisher matrices
     fisher_comparison = analyzer.compare_fisher_matrices(base_fisher, instruct_fisher)
     
+    # Compare task vector Fisher with base and instruct
+    task_vector_comparison = analyzer.compare_fisher_matrices(base_fisher, task_vector_fisher)
+    
     # Print comprehensive analysis
-    analyzer.print_comprehensive_analysis(base_layers, instruct_layers, task_analysis, fisher_comparison)
+    analyzer.print_comprehensive_analysis(base_layers, instruct_layers, task_analysis, fisher_comparison, task_vector_layers, task_vector_comparison)
     
     # Save all results
     analyzer.save_results(
-        base_fisher, instruct_fisher, task_vector,
-        base_layers, instruct_layers, task_analysis, fisher_comparison, args.output_dir
+        base_fisher, instruct_fisher, task_vector, task_vector_fisher,
+        base_layers, instruct_layers, task_vector_layers, task_analysis, fisher_comparison, task_vector_comparison, args.output_dir
     )
     
     print(f"\n✓ Comprehensive analysis complete!")

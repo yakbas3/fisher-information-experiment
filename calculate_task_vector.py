@@ -240,12 +240,13 @@ class TaskVectorCalculator:
         print(f"✓ Analysis saved to {output_dir}/task_vector_analysis.json")
         
         # Save model info
+        import datetime
         model_info = {
             'base_model': self.base_model_path,
             'instruct_model': self.instruct_model_path,
             'device': self.device,
             'total_parameters': len(task_vector),
-            'calculation_timestamp': str(torch.cuda.Event(enable_timing=True).record().elapsed_time(torch.cuda.Event(enable_timing=True).record()))
+            'calculation_timestamp': datetime.datetime.now().isoformat()
         }
         
         with open(f'{output_dir}/model_info.json', 'w') as f:

@@ -17,9 +17,18 @@ from plot_fim import plot_importance_comparison
 
 def find_result_files(results_dir, benchmark, model_type):
     """Find layer_importance.json files for a specific benchmark and model type."""
-    pattern = os.path.join(results_dir, f"*{benchmark}*{model_type}*", "layer_importance.json")
-    files = glob.glob(pattern)
-    return files[0] if files else None
+    # Try both patterns: model_benchmark and benchmark_model
+    patterns = [
+        os.path.join(results_dir, f"*{model_type}*{benchmark}*", "layer_importance.json"),
+        os.path.join(results_dir, f"*{benchmark}*{model_type}*", "layer_importance.json")
+    ]
+    
+    for pattern in patterns:
+        files = glob.glob(pattern)
+        if files:
+            return files[0]
+    
+    return None
 
 def main():
     parser = argparse.ArgumentParser(description='Generate comparison plots for FIM experiments')
@@ -60,12 +69,12 @@ def main():
         
         if not math_file:
             print(f"❌ Could not find Math model results for {exp['name']}")
-            print(f"   Looking for pattern: *{exp['benchmark']}*math*layer_importance.json")
+            print(f"   Looking for patterns: *math*{exp['benchmark']}* or *{exp['benchmark']}*math*")
             continue
             
         if not coder_file:
             print(f"❌ Could not find Coder model results for {exp['name']}")
-            print(f"   Looking for pattern: *{exp['benchmark']}*coder*layer_importance.json")
+            print(f"   Looking for patterns: *coder*{exp['benchmark']}* or *{exp['benchmark']}*coder*")
             continue
         
         print(f"✓ Found Math model results: {math_file}")

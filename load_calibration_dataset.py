@@ -1,10 +1,11 @@
 """
 Load calibration data from HuggingFace datasets for Fisher Information calculation
 
-Supports multiple code datasets:
+Supports multiple datasets:
 - codeparrot/github-code (clean Python code)
 - bigcode/the-stack-dedup (multilingual, massive)
 - openai_humaneval (high-quality Python problems)
+- gsm8k (Grade School Math 8K - mathematical reasoning)
 
 Usage:
     # Generate calibration file with 500 samples
@@ -152,6 +153,35 @@ def load_code_alpaca(num_samples=500):
     return samples
 
 
+def load_gsm8k(num_samples=500, min_length=50, max_length=2000):
+    """
+    Load from GSM8K (Grade School Math 8K) dataset
+    Best for: Mathematical reasoning problems
+    """
+    print("Loading GSM8K dataset (Grade School Math)...")
+    
+    dataset = load_dataset("gsm8k", "main", split="train")
+    
+    # Shuffle for diversity
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    
+    samples = []
+    for idx in tqdm(indices[:num_samples], desc="Collecting samples"):
+        item = dataset[idx]
+        # Combine question and answer for mathematical reasoning
+        problem = f"Question: {item['question']}\nAnswer: {item['answer']}"
+        
+        # Filter by length
+        if min_length <= len(problem) <= max_length:
+            samples.append(problem)
+        
+        if len(samples) >= num_samples:
+            break
+    
+    return samples
+
+
 def save_samples(samples, output_file):
     """Save samples to file (one per line)"""
     print(f"\nSaving {len(samples)} samples to {output_file}...")
@@ -176,7 +206,7 @@ def save_samples(samples, output_file):
 def main():
     parser = argparse.ArgumentParser(description='Load calibration data from HuggingFace datasets')
     parser.add_argument('--dataset', type=str, default='codeparrot',
-                       choices=['codeparrot', 'the-stack', 'humaneval', 'code-contests', 'code-alpaca'],
+                       choices=['codeparrot', 'the-stack', 'humaneval', 'code-contests', 'code-alpaca', 'gsm8k'],
                        help='Which dataset to use (default: codeparrot)')
     parser.add_argument('--language', type=str, default='python',
                        help='Programming language (for the-stack dataset)')
@@ -220,6 +250,9 @@ def main():
         
         elif args.dataset == 'code-alpaca':
             samples = load_code_alpaca(args.num_samples)
+        
+        elif args.dataset == 'gsm8k':
+            samples = load_gsm8k(args.num_samples, args.min_length, args.max_length)
         
         else:
             raise ValueError(f"Unknown dataset: {args.dataset}")

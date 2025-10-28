@@ -266,7 +266,112 @@ class FisherCalculator:
         
         return 'other'
     
-    def save_results(self, fisher_dict, layer_importance, output_dir):
+    def _parse_component_name(self, param_name):
+        """Extract component identifier from parameter name (more granular than layer)"""
+        # Examples of components: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, etc.
+        
+        # Embeddings
+        if 'embed' in param_name.lower():
+            return 'embeddings'
+        
+        # LM head
+        elif 'lm_head' in param_name or ('output' in param_name and 'layer' not in param_name):
+            return 'lm_head'
+        
+        # Final norm
+        elif 'norm' in param_name.lower() and 'layer' not in param_name.lower() and 'layers' not in param_name:
+            return 'final_norm'
+        
+        # Layer-specific components
+        elif 'layers.' in param_name or '.layers.' in param_name:
+            parts = param_name.split('.')
+            
+            # Find layer number
+            layer_num = None
+            for i, part in enumerate(parts):
+                if part == 'layers' and i + 1 < len(parts):
+                    try:
+                        layer_num = int(parts[i+1])
+                        break
+                    except ValueError:
+                        pass
+            
+            if layer_num is None:
+                return 'other'
+            
+            # Identify component type
+            # Attention components
+            if 'q_proj' in param_name:
+                return f"layer_{layer_num}.q_proj"
+            elif 'k_proj' in param_name:
+                return f"layer_{layer_num}.k_proj"
+            elif 'v_proj' in param_name:
+                return f"layer_{layer_num}.v_proj"
+            elif 'o_proj' in param_name or 'out_proj' in param_name:
+                return f"layer_{layer_num}.o_proj"
+            
+            # MLP components
+            elif 'gate_proj' in param_name:
+                return f"layer_{layer_num}.mlp.gate_proj"
+            elif 'up_proj' in param_name:
+                return f"layer_{layer_num}.mlp.up_proj"
+            elif 'down_proj' in param_name:
+                return f"layer_{layer_num}.mlp.down_proj"
+            elif 'mlp' in param_name.lower():
+                # Generic MLP (for models with different naming)
+                if 'fc1' in param_name or 'w1' in param_name:
+                    return f"layer_{layer_num}.mlp.fc1"
+                elif 'fc2' in param_name or 'w2' in param_name:
+                    return f"layer_{layer_num}.mlp.fc2"
+                else:
+                    return f"layer_{layer_num}.mlp"
+            
+            # Layer norms
+            elif 'input_layernorm' in param_name or 'ln_1' in param_name:
+                return f"layer_{layer_num}.input_layernorm"
+            elif 'post_attention_layernorm' in param_name or 'ln_2' in param_name:
+                return f"layer_{layer_num}.post_attention_layernorm"
+            elif 'norm' in param_name.lower():
+                return f"layer_{layer_num}.norm"
+            
+            # Default to just layer if component unclear
+            else:
+                return f"layer_{layer_num}.other"
+        
+        return 'other'
+    
+    def aggregate_by_component(self, fisher_dict):
+        """
+        Aggregate Fisher values by component (more granular than layer)
+        
+        Returns:
+            component_importance: {component_id: importance_score}
+        """
+        component_importance = defaultdict(float)
+        
+        for param_name, fisher_values in fisher_dict.items():
+            param_importance = fisher_values.sum().item()
+            
+            # Skip if NaN or inf
+            if torch.isnan(torch.tensor(param_importance)) or torch.isinf(torch.tensor(param_importance)):
+                print(f"Warning: Skipping {param_name} due to NaN/Inf values")
+                continue
+            
+            component_id = self._parse_component_name(param_name)
+            component_importance[component_id] += param_importance
+        
+        # Sort and normalize
+        total = sum(component_importance.values())
+        
+        if total == 0:
+            print("Warning: Total importance is zero, cannot normalize")
+            return dict(sorted(component_importance.items()))
+        
+        normalized = {k: v / total for k, v in component_importance.items()}
+        
+        return dict(sorted(normalized.items(), key=lambda x: x[1], reverse=True))
+    
+    def save_results(self, fisher_dict, layer_importance, component_importance, output_dir, save_fisher_dict=False):
         """Save results to disk"""
         os.makedirs(output_dir, exist_ok=True)
         
@@ -274,16 +379,25 @@ class FisherCalculator:
         with open(f'{output_dir}/layer_importance.json', 'w') as f:
             json.dump(layer_importance, f, indent=2)
         
-        # Save full Fisher dict (PyTorch) - DISABLED for large models (can be 20+ GB)
-        # Uncomment if you need raw per-parameter Fisher values
-        # torch.save(fisher_dict, f'{output_dir}/fisher_diagonal.pt')
-        print(f"\n⚠️  Skipping fisher_diagonal.pt (would be ~{sum(p.numel() for p in fisher_dict.values()) * 4 / 1e9:.1f} GB)")
+        # Save component importance (JSON) - NEW: more granular than layers
+        with open(f'{output_dir}/component_importance.json', 'w') as f:
+            json.dump(component_importance, f, indent=2)
+        
+        # Save full Fisher dict (PyTorch) - OPTIONAL, can be 20+ GB for large models
+        if save_fisher_dict:
+            print(f"\n💾 Saving full fisher_diagonal.pt (~{sum(p.numel() for p in fisher_dict.values()) * 4 / 1e9:.1f} GB)...")
+            torch.save(fisher_dict, f'{output_dir}/fisher_diagonal.pt')
+            print("✓ fisher_diagonal.pt saved")
+        else:
+            print(f"\n⚠️  Skipping fisher_diagonal.pt (would be ~{sum(p.numel() for p in fisher_dict.values()) * 4 / 1e9:.1f} GB)")
+            print("   Use --save_fisher_dict to save raw per-parameter Fisher values")
         
         # Save summary statistics
         summary = {
             'total_parameters': len(fisher_dict),
             'total_fisher_information': sum(f.sum().item() for f in fisher_dict.values()),
-            'top_10_parameters': []
+            'top_10_parameters': [],
+            'top_10_components': []
         }
         
         # Get top 10 most important parameters
@@ -291,12 +405,19 @@ class FisherCalculator:
         param_importance.sort(key=lambda x: x[1], reverse=True)
         summary['top_10_parameters'] = param_importance[:10]
         
+        # Get top 10 most important components
+        component_sorted = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
+        summary['top_10_components'] = component_sorted[:10]
+        
         with open(f'{output_dir}/summary.json', 'w') as f:
             json.dump(summary, f, indent=2)
         
         print(f"\n✓ Saved to {output_dir}/")
         print(f"  - layer_importance.json")
+        print(f"  - component_importance.json")
         print(f"  - summary.json")
+        if save_fisher_dict:
+            print(f"  - fisher_diagonal.pt")
     
     def print_results(self, layer_importance):
         """Pretty print results"""
@@ -311,6 +432,25 @@ class FisherCalculator:
                 print(f"{layer:<20} {'NaN':>15} {'N/A':>12}")
             else:
                 print(f"{layer:<20} {importance:>15.8f} {importance*100:>11.2f}%")
+        
+        print("="*70)
+    
+    def print_component_results(self, component_importance, top_n=20):
+        """Pretty print component-level results"""
+        print("\n" + "="*70)
+        print(f"COMPONENT IMPORTANCE RANKINGS (Top {top_n})")
+        print("="*70)
+        print(f"{'Component':<45} {'Importance':>15} {'%':>8}")
+        print("-"*70)
+        
+        # Get top N components
+        sorted_components = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
+        
+        for component, importance in sorted_components[:top_n]:
+            if torch.isnan(torch.tensor(importance)):
+                print(f"{component:<45} {'NaN':>15} {'N/A':>8}")
+            else:
+                print(f"{component:<45} {importance:>15.8f} {importance*100:>7.2f}%")
         
         print("="*70)
 
@@ -365,6 +505,8 @@ def main():
                        help='Output directory (default: fisher_results)')
     parser.add_argument('--use_fp16', action='store_true',
                        help='Use float16 precision (can cause numerical issues)')
+    parser.add_argument('--save_fisher_dict', action='store_true',
+                       help='Save full per-parameter Fisher dict (can be 20+ GB for large models)')
     
     args = parser.parse_args()
     
@@ -396,11 +538,16 @@ def main():
     # Aggregate by layer
     layer_importance = calculator.aggregate_by_layer(fisher_dict)
     
+    # Aggregate by component (more granular)
+    component_importance = calculator.aggregate_by_component(fisher_dict)
+    
     # Print results
     calculator.print_results(layer_importance)
+    calculator.print_component_results(component_importance, top_n=30)
     
     # Save results
-    calculator.save_results(fisher_dict, layer_importance, args.output_dir)
+    calculator.save_results(fisher_dict, layer_importance, component_importance, 
+                           args.output_dir, save_fisher_dict=args.save_fisher_dict)
     
     print("\n✓ Done!")
 

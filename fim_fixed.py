@@ -274,8 +274,10 @@ class FisherCalculator:
         with open(f'{output_dir}/layer_importance.json', 'w') as f:
             json.dump(layer_importance, f, indent=2)
         
-        # Save full Fisher dict (PyTorch)
-        torch.save(fisher_dict, f'{output_dir}/fisher_diagonal.pt')
+        # Save full Fisher dict (PyTorch) - DISABLED for large models (can be 20+ GB)
+        # Uncomment if you need raw per-parameter Fisher values
+        # torch.save(fisher_dict, f'{output_dir}/fisher_diagonal.pt')
+        print(f"\n⚠️  Skipping fisher_diagonal.pt (would be ~{sum(p.numel() for p in fisher_dict.values()) * 4 / 1e9:.1f} GB)")
         
         # Save summary statistics
         summary = {
@@ -294,7 +296,6 @@ class FisherCalculator:
         
         print(f"\n✓ Saved to {output_dir}/")
         print(f"  - layer_importance.json")
-        print(f"  - fisher_diagonal.pt")
         print(f"  - summary.json")
     
     def print_results(self, layer_importance):

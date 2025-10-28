@@ -474,8 +474,25 @@ class FisherCalculator:
         summary['top_10_parameters'] = param_importance[:10]
         
         # Get top 10 most important components
-        component_sorted = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
-        summary['top_10_components'] = component_sorted[:10]
+        component_sorted = sorted(component_importance.items(), 
+                                 key=lambda x: x[1]['fisher_sum'] if isinstance(x[1], dict) else x[1], 
+                                 reverse=True)
+        # Convert to serializable format for JSON
+        top_10_components = []
+        for comp_id, data in component_sorted[:10]:
+            if isinstance(data, dict):
+                top_10_components.append({
+                    'component': comp_id,
+                    'fisher_sum': data['fisher_sum'],
+                    'percentage': data['percentage']
+                })
+            else:
+                top_10_components.append({
+                    'component': comp_id,
+                    'fisher_sum': data,
+                    'percentage': 0
+                })
+        summary['top_10_components'] = top_10_components
         
         with open(f'{output_dir}/summary.json', 'w') as f:
             json.dump(summary, f, indent=2)

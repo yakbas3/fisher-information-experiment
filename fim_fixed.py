@@ -340,36 +340,104 @@ class FisherCalculator:
         
         return 'other'
     
-    def aggregate_by_component(self, fisher_dict):
+    def aggregate_by_component(self, fisher_dict, granularity=None):
         """
         Aggregate Fisher values by component (more granular than layer)
         
+        Args:
+            granularity: If None, aggregate entire components. If int > 0, split each component into N chunks
+        
         Returns:
-            component_importance: {component_id: importance_score}
+            component_importance: {component_id: {'fisher_sum': value, 'percentage': pct}}
         """
-        component_importance = defaultdict(float)
-        
-        for param_name, fisher_values in fisher_dict.items():
-            param_importance = fisher_values.sum().item()
+        if granularity is None:
+            # Original behavior: aggregate entire components
+            component_importance = defaultdict(float)
             
-            # Skip if NaN or inf
-            if torch.isnan(torch.tensor(param_importance)) or torch.isinf(torch.tensor(param_importance)):
-                print(f"Warning: Skipping {param_name} due to NaN/Inf values")
-                continue
+            for param_name, fisher_values in fisher_dict.items():
+                param_importance = fisher_values.sum().item()
+                
+                # Skip if NaN or inf
+                if torch.isnan(torch.tensor(param_importance)) or torch.isinf(torch.tensor(param_importance)):
+                    print(f"Warning: Skipping {param_name} due to NaN/Inf values")
+                    continue
+                
+                component_id = self._parse_component_name(param_name)
+                component_importance[component_id] += param_importance
             
-            component_id = self._parse_component_name(param_name)
-            component_importance[component_id] += param_importance
+            # Calculate percentages
+            total = sum(component_importance.values())
+            
+            if total == 0:
+                print("Warning: Total importance is zero, cannot normalize")
+                return dict(sorted(component_importance.items()))
+            
+            # Return dict with fisher_sum and percentage
+            result = {}
+            for component_id, fisher_sum in component_importance.items():
+                result[component_id] = {
+                    'fisher_sum': fisher_sum,
+                    'percentage': fisher_sum / total
+                }
+            
+            return dict(sorted(result.items(), key=lambda x: x[1]['fisher_sum'], reverse=True))
         
-        # Sort and normalize
-        total = sum(component_importance.values())
-        
-        if total == 0:
-            print("Warning: Total importance is zero, cannot normalize")
-            return dict(sorted(component_importance.items()))
-        
-        normalized = {k: v / total for k, v in component_importance.items()}
-        
-        return dict(sorted(normalized.items(), key=lambda x: x[1], reverse=True))
+        else:
+            # New behavior: split components into chunks
+            print(f"\n🔍 Splitting components into {granularity} chunks each...")
+            chunk_importance = {}
+            
+            for param_name, fisher_values in fisher_dict.items():
+                # Skip if NaN or inf
+                if torch.isnan(fisher_values).any() or torch.isinf(fisher_values).any():
+                    print(f"Warning: Skipping {param_name} due to NaN/Inf values")
+                    continue
+                
+                component_id = self._parse_component_name(param_name)
+                
+                # Flatten the tensor to 1D for chunking
+                fisher_flat = fisher_values.flatten()
+                total_elements = fisher_flat.numel()
+                
+                # Split into N chunks
+                chunk_size = max(1, total_elements // granularity)
+                
+                for chunk_idx in range(granularity):
+                    start_idx = chunk_idx * chunk_size
+                    end_idx = min(start_idx + chunk_size, total_elements)
+                    
+                    if start_idx >= total_elements:
+                        break
+                    
+                    # Get chunk and sum Fisher values
+                    chunk_fisher = fisher_flat[start_idx:end_idx].sum().item()
+                    
+                    # Create chunk identifier
+                    chunk_id = f"{component_id}[{chunk_idx}]"
+                    
+                    if chunk_id not in chunk_importance:
+                        chunk_importance[chunk_id] = 0.0
+                    
+                    chunk_importance[chunk_id] += chunk_fisher
+            
+            # Calculate percentages
+            total = sum(chunk_importance.values())
+            
+            if total == 0:
+                print("Warning: Total importance is zero, cannot normalize")
+                return dict(sorted(chunk_importance.items()))
+            
+            # Return dict with fisher_sum and percentage
+            result = {}
+            for chunk_id, fisher_sum in chunk_importance.items():
+                result[chunk_id] = {
+                    'fisher_sum': fisher_sum,
+                    'percentage': fisher_sum / total
+                }
+            
+            print(f"✓ Created {len(result)} chunks from {len(fisher_dict)} parameters")
+            
+            return dict(sorted(result.items(), key=lambda x: x[1]['fisher_sum'], reverse=True))
     
     def save_results(self, fisher_dict, layer_importance, component_importance, output_dir, save_fisher_dict=False):
         """Save results to disk"""
@@ -435,22 +503,35 @@ class FisherCalculator:
         
         print("="*70)
     
-    def print_component_results(self, component_importance, top_n=20):
+    def print_component_results(self, component_importance, top_n=20, granularity=None):
         """Pretty print component-level results"""
         print("\n" + "="*70)
-        print(f"COMPONENT IMPORTANCE RANKINGS (Top {top_n})")
+        if granularity:
+            print(f"CHUNK IMPORTANCE RANKINGS (Top {top_n}, Granularity: {granularity})")
+        else:
+            print(f"COMPONENT IMPORTANCE RANKINGS (Top {top_n})")
         print("="*70)
-        print(f"{'Component':<45} {'Importance':>15} {'%':>8}")
+        print(f"{'Component/Chunk':<50} {'Fisher Sum':>15} {'%':>8}")
         print("-"*70)
         
-        # Get top N components
-        sorted_components = sorted(component_importance.items(), key=lambda x: x[1], reverse=True)
+        # Get top N components/chunks
+        sorted_components = sorted(component_importance.items(), 
+                                   key=lambda x: x[1]['fisher_sum'] if isinstance(x[1], dict) else x[1], 
+                                   reverse=True)
         
-        for component, importance in sorted_components[:top_n]:
-            if torch.isnan(torch.tensor(importance)):
-                print(f"{component:<45} {'NaN':>15} {'N/A':>8}")
+        for component, data in sorted_components[:top_n]:
+            if isinstance(data, dict):
+                fisher_sum = data['fisher_sum']
+                percentage = data['percentage']
             else:
-                print(f"{component:<45} {importance:>15.8f} {importance*100:>7.2f}%")
+                # Backward compatibility (shouldn't happen with new code)
+                fisher_sum = data
+                percentage = 0
+            
+            if torch.isnan(torch.tensor(fisher_sum)):
+                print(f"{component:<50} {'NaN':>15} {'N/A':>8}")
+            else:
+                print(f"{component:<50} {fisher_sum:>15.6e} {percentage*100:>7.2f}%")
         
         print("="*70)
 
@@ -507,6 +588,8 @@ def main():
                        help='Use float16 precision (can cause numerical issues)')
     parser.add_argument('--save_fisher_dict', action='store_true',
                        help='Save full per-parameter Fisher dict (can be 20+ GB for large models)')
+    parser.add_argument('--granularity', type=int, default=None,
+                       help='Split each component into N chunks for fine-grained analysis (e.g., 64). Default: None (no chunking)')
     
     args = parser.parse_args()
     
@@ -538,12 +621,15 @@ def main():
     # Aggregate by layer
     layer_importance = calculator.aggregate_by_layer(fisher_dict)
     
-    # Aggregate by component (more granular)
-    component_importance = calculator.aggregate_by_component(fisher_dict)
+    # Aggregate by component (more granular) with optional chunking
+    component_importance = calculator.aggregate_by_component(fisher_dict, granularity=args.granularity)
     
     # Print results
     calculator.print_results(layer_importance)
-    calculator.print_component_results(component_importance, top_n=30)
+    
+    # Print component/chunk results with more items if using granularity
+    top_n = 50 if args.granularity else 30
+    calculator.print_component_results(component_importance, top_n=top_n, granularity=args.granularity)
     
     # Save results
     calculator.save_results(fisher_dict, layer_importance, component_importance, 

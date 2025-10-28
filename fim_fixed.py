@@ -1,11 +1,12 @@
 """
-Calculate Fisher Information Matrix (Diagonal) for any PyTorch Model - FIXED VERSION
+Calculate Fisher Information Matrix (Diagonal) for any PyTorch Model - CORRECTED VERSION
 
 Key fixes:
 1. Use float32 instead of float16 to avoid gradient underflow
 2. Properly accumulate and normalize Fisher values
 3. Better debugging output
 4. Handle edge cases
+5. FIXED: Compute per-sample gradients instead of batch-averaged gradients
 """
 
 import torch
@@ -114,6 +115,12 @@ class FisherCalculator:
             if param.requires_grad:
                 fisher_dict[name] = torch.zeros_like(param, dtype=torch.float32)
         
+        # Define loss function to get per-token losses
+        loss_fct = torch.nn.CrossEntropyLoss(
+            reduction='none',
+            ignore_index=self.tokenizer.pad_token_id
+        )
+        
         num_batches_processed = 0
         total_samples_processed = 0
         
@@ -126,57 +133,62 @@ class FisherCalculator:
             attention_mask = batch['attention_mask'].to(self.device)
             batch_size_actual = input_ids.size(0)
             
-            # Forward pass with gradient tracking
-            self.model.zero_grad()
-            
+            # 1. Forward pass to get logits (DO NOT pass labels)
             with torch.enable_grad():
                 outputs = self.model(
                     input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=input_ids
+                    attention_mask=attention_mask
+                )
+                logits = outputs.logits
+                
+                # 2. Manually compute per-sample loss
+                # Shift logits and labels for Causal LM loss
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = input_ids[..., 1:].contiguous()
+                
+                # Get loss for each token
+                per_token_loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1)
                 )
                 
-                loss = outputs.loss
+                # Reshape to [batch_size, seq_len]
+                per_token_loss = per_token_loss.view(batch_size_actual, -1)
                 
-                # Check if loss is valid
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Warning: Invalid loss detected in batch {batch_idx}, skipping")
-                    continue
+                # Get number of non-ignored tokens per sample
+                non_ignored_tokens = (shift_labels != self.tokenizer.pad_token_id).sum(dim=1)
+                # Avoid division by zero
+                non_ignored_tokens = torch.clamp(non_ignored_tokens, min=1)
                 
-                # Backward pass
-                loss.backward()
+                # Calculate the mean loss *per sample*
+                per_sample_loss = per_token_loss.sum(dim=1) / non_ignored_tokens
                 
                 # Debug first batch
                 if batch_idx == 0:
-                    grad_stats = []
-                    for name, param in self.model.named_parameters():
-                        if param.requires_grad and param.grad is not None:
-                            grad_norm = param.grad.norm().item()
-                            if grad_norm > 0:
-                                grad_stats.append((name, grad_norm))
-                    
                     print(f"\n{'='*70}")
                     print(f"First Batch Debug Info:")
-                    print(f"Loss: {loss.item():.4f}")
-                    print(f"Parameters with gradients: {len(grad_stats)}")
-                    if len(grad_stats) > 0:
-                        print(f"Sample gradient norms:")
-                        for name, norm in grad_stats[:5]:
-                            print(f"  {name}: {norm:.6e}")
+                    print(f"Batch size: {batch_size_actual}")
+                    print(f"Per-sample losses: {[f'{x:.4f}' for x in per_sample_loss.detach().cpu().tolist()]}")
                     print(f"{'='*70}\n")
                 
-                # Accumulate squared gradients (Fisher diagonal approximation)
-                # IMPORTANT: Computing FIM correctly requires per-sample gradients, not batch-averaged gradients
-                # ISSUE: loss.backward() computes mean gradients, but we need E[g^2], not (E[g])^2
-                # For now, we approximate: E[g^2] ≈ (E[g])^2 (only accurate if gradients don't vary much within batch)
-                # For accurate results, set batch_size=1 or use per-sample gradient hooks
-                for name, param in self.model.named_parameters():
-                    if param.requires_grad and param.grad is not None:
-                        # Convert to float32 and square
-                        # CAUTION: This accumulates (mean_gradient)^2, not mean(gradient^2)
-                        # May be inaccurate if gradients vary significantly within batches
-                        grad_squared = param.grad.detach().to(torch.float32).pow(2)
-                        fisher_dict[name] += grad_squared * batch_size_actual
+                # Check if any loss is invalid
+                if torch.isnan(per_sample_loss).any() or torch.isinf(per_sample_loss).any():
+                    print(f"Warning: Invalid loss detected in batch {batch_idx}, skipping")
+                    continue
+                
+                # 3. Iterate over each sample to get per-sample gradients
+                for j in range(batch_size_actual):
+                    self.model.zero_grad()
+                    
+                    # Backward pass for the j-th sample
+                    # Retain graph if not the last sample in the batch
+                    is_last_sample = (j == batch_size_actual - 1)
+                    per_sample_loss[j].backward(retain_graph=not is_last_sample)
+                    
+                    # 4. Accumulate squared gradients (Fisher diagonal approximation)
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad and param.grad is not None:
+                            fisher_dict[name] += param.grad.detach().to(torch.float32).pow(2)
             
             num_batches_processed += 1
             total_samples_processed += batch_size_actual
@@ -186,11 +198,6 @@ class FisherCalculator:
         
         for name in fisher_dict:
             fisher_dict[name] /= total_samples_processed
-            
-            # Debug: check if values are reasonable
-            fisher_sum = fisher_dict[name].sum().item()
-            if batch_idx < 2:  # Only for first couple iterations
-                print(f"  {name}: sum={fisher_sum:.6e}")
         
         print(f"✓ Computed Fisher for {total_samples_processed} samples across {num_batches_processed} batches")
         
@@ -361,7 +368,7 @@ def main():
     args = parser.parse_args()
     
     print("="*70)
-    print("Fisher Information Matrix Calculator - FIXED VERSION")
+    print("Fisher Information Matrix Calculator - CORRECTED VERSION")
     print("="*70)
     
     # Load calibration data
@@ -399,3 +406,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
